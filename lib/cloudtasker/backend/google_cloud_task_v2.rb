@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'google/cloud/tasks'
+require 'google/protobuf/duration_pb'
 require 'google/protobuf/timestamp_pb'
 require 'retriable'
 
@@ -71,7 +72,7 @@ module Cloudtasker
         client.queue_path(
           project: config.gcp_project_id,
           location: config.gcp_location_id,
-          queue: [config.gcp_queue_prefix, queue_name].join('-')
+          queue: [config.gcp_queue_prefix, queue_name].map(&:presence).compact.join('-')
         )
       end
 
@@ -83,7 +84,7 @@ module Cloudtasker
       #
       # @return [Google::Protobuf::Timestamp, nil] The protobuff timestamp
       #
-      def self.format_schedule_time(schedule_time)
+      def self.format_protobuf_time(schedule_time)
         return nil unless schedule_time
 
         # Generate protobuf timestamp
@@ -91,17 +92,34 @@ module Cloudtasker
       end
 
       #
+      # Return a protobuf duration.
+      #
+      # @param [Integer, nil] duration A duration in seconds.
+      #
+      # @return [Google::Protobuf::Timestamp, nil] The protobuff timestamp
+      #
+      def self.format_protobuf_duration(duration)
+        return nil unless duration
+
+        # Generate protobuf timestamp
+        Google::Protobuf::Duration.new.tap { |e| e.seconds = duration.to_i }
+      end
+
+      #
       # Format the job payload sent to Cloud Tasks.
       #
       # @param [Hash] hash The worker payload.
       #
-      # @return [Hash] The Cloud Task payloadd.
+      # @return [Hash] The Cloud Task payload.
       #
       def self.format_task_payload(payload)
         payload = JSON.parse(payload.to_json, symbolize_names: true) # deep dup
 
-        # Format schedule time to Google Protobuf timestamp
-        payload[:schedule_time] = format_schedule_time(payload[:schedule_time])
+        # Format schedule time to Google::Protobuf::Timestamp
+        payload[:schedule_time] = format_protobuf_time(payload[:schedule_time])
+
+        # Format dispatch_deadline to Google::Protobuf::Duration
+        payload[:dispatch_deadline] = format_protobuf_duration(payload[:dispatch_deadline])
 
         # Encode job content to support UTF-8.
         # Google Cloud Task expect content to be ASCII-8BIT compatible (binary)
@@ -110,7 +128,7 @@ module Cloudtasker
         payload[:http_request][:headers][Cloudtasker::Config::ENCODING_HEADER] = 'Base64'
         payload[:http_request][:body] = Base64.encode64(payload[:http_request][:body])
 
-        payload
+        payload.compact
       end
 
       #
@@ -162,10 +180,8 @@ module Cloudtasker
       #
       # Helper method encapsulating the retry strategy for Google API calls
       #
-      def self.with_gapi_retries
-        Retriable.retriable(on: [Google::Cloud::UnavailableError], tries: 3) do
-          yield
-        end
+      def self.with_gapi_retries(&block)
+        Retriable.retriable(on: [Google::Cloud::UnavailableError], tries: 3, &block)
       end
 
       #
@@ -188,7 +204,7 @@ module Cloudtasker
           .match(%r{/queues/([^/]+)})
           &.captures
           &.first
-          &.sub("#{self.class.config.gcp_queue_prefix}-", '')
+          &.sub(/^#{self.class.config.gcp_queue_prefix}-/, '')
       end
 
       #
@@ -201,6 +217,7 @@ module Cloudtasker
           id: gcp_task.name,
           http_request: gcp_task.to_h[:http_request],
           schedule_time: gcp_task.to_h.dig(:schedule_time, :seconds).to_i,
+          dispatch_deadline: gcp_task.to_h.dig(:dispatch_deadline, :seconds).to_i,
           retries: gcp_task.to_h[:response_count],
           queue: relative_queue
         }

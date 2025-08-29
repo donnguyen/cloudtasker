@@ -55,6 +55,15 @@ module Cloudtasker
     # Module class methods
     module ClassMethods
       #
+      # Return the Cloudtasker redis client
+      #
+      # @return [Cloudtasker::RedisClient] The cloudtasker redis client.
+      #
+      def redis
+        @redis ||= RedisClient.new
+      end
+
+      #
       # Set the worker runtime options.
       #
       # @param [Hash] opts The worker options.
@@ -63,7 +72,7 @@ module Cloudtasker
       #
       def cloudtasker_options(opts = {})
         opt_list = opts&.map { |k, v| [k.to_sym, v] } || [] # symbolize
-        @cloudtasker_options_hash = Hash[opt_list]
+        @cloudtasker_options_hash = opt_list.to_h
       end
 
       #
@@ -73,6 +82,17 @@ module Cloudtasker
       #
       def cloudtasker_options_hash
         @cloudtasker_options_hash || {}
+      end
+
+      #
+      # Return a namespaced cache key.
+      #
+      # @param [Any, Array<Any>, nil] val The key to namespace
+      #
+      # @return [String] The namespaced key(s).
+      #
+      def cache_key(val = nil)
+        [to_s.underscore, val].flatten.compact.map(&:to_s).join('/')
       end
 
       #
@@ -174,13 +194,13 @@ module Cloudtasker
     # @return [Integer] The value in seconds.
     #
     def dispatch_deadline
-      @dispatch_deadline ||= [
-        [
-          Config::MIN_DISPATCH_DEADLINE,
-          (self.class.cloudtasker_options_hash[:dispatch_deadline] || Cloudtasker.config.dispatch_deadline).to_i
-        ].max,
-        Config::MAX_DISPATCH_DEADLINE
-      ].min
+      @dispatch_deadline ||= begin
+        configured_deadline = (
+          self.class.cloudtasker_options_hash[:dispatch_deadline] ||
+          Cloudtasker.config.dispatch_deadline
+        ).to_i
+        configured_deadline.clamp(Config::MIN_DISPATCH_DEADLINE, Config::MAX_DISPATCH_DEADLINE)
+      end
     end
 
     #
@@ -204,13 +224,16 @@ module Cloudtasker
       resp = execute_middleware_chain
 
       # Log job completion and return result
-      logger.info("Job done after #{job_duration}s") { { duration: job_duration } }
+      logger.info("Job done after #{job_duration}s") { { duration: job_duration * 1000 } }
       resp
     rescue DeadWorkerError => e
-      logger.info("Job dead after #{job_duration}s and #{job_retries} retries") { { duration: job_duration } }
+      logger.info("Job dead after #{job_duration}s and #{job_retries} retries") { { duration: job_duration * 1000 } }
+      raise(e)
+    rescue RetryWorkerError => e
+      logger.info("Job done after #{job_duration}s (retry requested)") { { duration: job_duration * 1000 } }
       raise(e)
     rescue StandardError => e
-      logger.info("Job failed after #{job_duration}s") { { duration: job_duration } }
+      logger.info("Job failed after #{job_duration}s") { { duration: job_duration * 1000 } }
       raise(e)
     end
 
@@ -235,7 +258,7 @@ module Cloudtasker
     # @param [Integer] interval The delay in seconds.
     # @param [Time, Integer] interval The time at which the job should run
     #
-    # @return [Cloudtasker::CloudTask] The Google Task response
+    # @return [Cloudtasker::CloudTask, nil] The Google Task response or nil if the job was not scheduled
     #
     def schedule(**args)
       # Evaluate when to schedule the job
@@ -323,7 +346,7 @@ module Cloudtasker
     # @return [Integer] The number of retries
     #
     def job_max_retries
-      @job_max_retries ||= (try(:max_retries, *job_args) || self.class.max_retries)
+      @job_max_retries ||= try(:max_retries, *job_args) || self.class.max_retries
     end
 
     #
@@ -373,7 +396,7 @@ module Cloudtasker
     def job_duration
       return 0.0 unless perform_ended_at && perform_started_at
 
-      (perform_ended_at - perform_started_at).ceil(3)
+      @job_duration ||= (perform_ended_at - perform_started_at).ceil(3)
     end
 
     #
@@ -422,7 +445,7 @@ module Cloudtasker
           # Perform the job
           perform(*job_args)
         rescue StandardError => e
-          run_callback(:on_error, e)
+          run_callback(:on_error, e) unless e.is_a?(RetryWorkerError)
           return raise(e) unless job_must_die?
 
           # Flag job as dead

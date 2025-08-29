@@ -14,7 +14,10 @@
 /tmp/
 
 # Ignore lock files (e.g. Gemfile.lock)
-*.lock
+/Gemfile.lock
 
 # rspec failure tracking
 .rspec_status
+
+# Dev databases
+*.sqlite3

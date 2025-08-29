@@ -47,9 +47,13 @@ module Cloudtasker
       # @return [Array<Cloudtasker::Backend::MemoryTask>] All the tasks
       #
       def self.all(worker_class_name = nil)
-        list = queue
-        list = list.select { |e| e.worker_class_name == worker_class_name } if worker_class_name
-        list
+        # Always return a copy of the queue so that tasks can safely be removed
+        # (via #execute) without tampering with the enumerator
+        if worker_class_name
+          queue.select { |e| e.worker_class_name == worker_class_name }
+        else
+          queue.dup
+        end
       end
 
       #
@@ -127,7 +131,7 @@ module Cloudtasker
       # @return [Hash] The task payload.
       #
       def payload
-        @payload ||= JSON.parse(http_request.dig(:body), symbolize_names: true)
+        @payload ||= JSON.parse(http_request[:body], symbolize_names: true)
       end
 
       #

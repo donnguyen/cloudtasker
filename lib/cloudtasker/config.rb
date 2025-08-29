@@ -5,26 +5,21 @@ require 'logger'
 module Cloudtasker
   # Holds cloudtasker configuration. See Cloudtasker#configure
   class Config
-    attr_accessor :redis, :store_payloads_in_redis
+    attr_accessor :redis, :store_payloads_in_redis, :gcp_queue_prefix
     attr_writer :secret, :gcp_location_id, :gcp_project_id,
-                :gcp_queue_prefix, :processor_path, :logger, :mode, :max_retries,
-                :dispatch_deadline, :on_error, :on_dead
+                :processor_path, :logger, :mode, :max_retries,
+                :dispatch_deadline, :on_error, :on_dead, :oidc, :local_server_ssl_verify
 
     # Max Cloud Task size in bytes
     MAX_TASK_SIZE = 100 * 1024 # 100 KB
 
     # Retry header in Cloud Task responses
     #
-    # TODO: use 'X-CloudTasks-TaskExecutionCount' instead of 'X-CloudTasks-TaskRetryCount'
-    #   'X-CloudTasks-TaskExecutionCount' is currently bugged and remains at 0 even on retries.
-    #
-    # See bug: https://issuetracker.google.com/issues/154532072
-    #
     # Definitions:
     #   X-CloudTasks-TaskRetryCount: total number of retries (including 504 "instance unreachable")
     #   X-CloudTasks-TaskExecutionCount: number of non-503 retries (= actual number of job failures)
     #
-    RETRY_HEADER = 'X-CloudTasks-TaskRetryCount'
+    RETRY_HEADER = 'X-Cloudtasks-Taskexecutioncount'
 
     # Cloud Task ID header
     TASK_ID_HEADER = 'X-CloudTasks-TaskName'
@@ -35,12 +30,18 @@ module Cloudtasker
     # Content Type
     CONTENT_TYPE_HEADER = 'Content-Type'
 
-    # Authorization header
-    AUTHORIZATION_HEADER = 'Authorization'
+    # OIDC Authorization header
+    OIDC_AUTHORIZATION_HEADER = 'Authorization'
+
+    # Custom authentication header that does not conflict with
+    # OIDC authorization header
+    CT_AUTHORIZATION_HEADER = 'X-Cloudtasker-Authorization'
+    CT_SIGNATURE_HEADER = 'X-Cloudtasker-Signature'
 
     # Default values
     DEFAULT_LOCATION_ID = 'us-east1'
     DEFAULT_PROCESSOR_PATH = '/cloudtasker/run'
+    DEFAULT_LOCAL_SERVER_SSL_VERIFY_MODE = true
 
     # Default queue values
     DEFAULT_JOB_QUEUE = 'default'
@@ -54,6 +55,10 @@ module Cloudtasker
 
     # Default on_error Proc
     DEFAULT_ON_ERROR = ->(error, worker) {}
+
+    # Cache key prefix used to store workers in cache and retrieve
+    # them later.
+    WORKER_STORE_PREFIX = 'worker_store'
 
     # The number of times jobs will be attempted before declaring them dead.
     #
@@ -70,11 +75,6 @@ module Cloudtasker
       Missing host for processing.
       Please specify a processor hostname in form of `https://some-public-dns.example.com`'
     DOC
-    QUEUE_PREFIX_MISSING_ERROR = <<~DOC
-      Missing GCP queue prefix.
-      Please specify a queue prefix in the form of `my-app`.
-      You can create a default queue using the Google SDK via `gcloud tasks queues create my-app-default`
-    DOC
     PROJECT_ID_MISSING_ERROR = <<~DOC
       Missing GCP project ID.
       Please specify a project ID in the cloudtasker configurator.
@@ -82,6 +82,10 @@ module Cloudtasker
     SECRET_MISSING_ERROR = <<~DOC
       Missing cloudtasker secret.
       Please specify a secret in the cloudtasker initializer or add Rails secret_key_base in your credentials
+    DOC
+    OIDC_EMAIL_MISSING_ERROR = <<~DOC
+      Missing OpenID Connect (OIDC) service account email.
+      You specified an OIDC configuration hash but the :service_account_email property is missing.
     DOC
 
     #
@@ -136,7 +140,7 @@ module Cloudtasker
     # @return [Logger, any] The cloudtasker logger.
     #
     def logger
-      @logger ||= defined?(Rails) ? Rails.logger : ::Logger.new(STDOUT)
+      @logger ||= defined?(Rails) ? Rails.logger : ::Logger.new($stdout)
     end
 
     #
@@ -187,15 +191,6 @@ module Cloudtasker
     #
     def processor_path
       @processor_path || DEFAULT_PROCESSOR_PATH
-    end
-
-    #
-    # Return the prefix used for queues.
-    #
-    # @return [String] The prefix of the processing queues.
-    #
-    def gcp_queue_prefix
-      @gcp_queue_prefix || raise(StandardError, QUEUE_PREFIX_MISSING_ERROR)
     end
 
     #
@@ -259,6 +254,21 @@ module Cloudtasker
     end
 
     #
+    # Return the Open ID Connect configuration to use for tasks.
+    #
+    # @return [Hash] The OIDC configuration
+    #
+    def oidc
+      return unless @oidc
+      raise(StandardError, OIDC_EMAIL_MISSING_ERROR) unless @oidc[:service_account_email]
+
+      {
+        service_account_email: @oidc[:service_account_email],
+        audience: @oidc[:audience] || processor_host
+      }
+    end
+
+    #
     # Return the chain of client middlewares.
     #
     # @return [Cloudtasker::Middleware::Chain] The chain of middlewares.
@@ -278,6 +288,15 @@ module Cloudtasker
       @server_middleware ||= Middleware::Chain.new
       yield @server_middleware if block_given?
       @server_middleware
+    end
+
+    #
+    # Return the ssl verify mode for the Cloudtasker local server.
+    #
+    # @return [Boolean] The ssl verify mode for the Cloudtasker local server.
+    #
+    def local_server_ssl_verify
+      @local_server_ssl_verify.nil? ? DEFAULT_LOCAL_SERVER_SSL_VERIFY_MODE : @local_server_ssl_verify
     end
   end
 end

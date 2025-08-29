@@ -1,4 +1,4 @@
-![Build Status](https://github.com/keypup-io/cloudtasker/workflows/Test/badge.svg) [![Gem Version](https://badge.fury.io/rb/cloudtasker.svg)](https://badge.fury.io/rb/cloudtasker)
+![Build Status 3.x](https://github.com/keypup-io/cloudtasker/actions/workflows/test_ruby_3.x.yml/badge.svg) [![Gem Version](https://badge.fury.io/rb/cloudtasker.svg)](https://badge.fury.io/rb/cloudtasker)
 
 # Cloudtasker
 
@@ -8,7 +8,7 @@ Cloudtasker provides an easy to manage interface to Google Cloud Tasks for backg
 
 Cloudtasker is particularly suited for serverless applications only responding to HTTP requests and where running a dedicated job processing server is not an option (e.g. deploy via [Cloud Run](https://cloud.google.com/run)). All jobs enqueued in Cloud Tasks via Cloudtasker eventually get processed by your application via HTTP requests.
 
-Cloudtasker also provides optional modules for running [cron jobs](docs/CRON_JOBS.md), [batch jobs](docs/BATCH_JOBS.md) and [unique jobs](docs/UNIQUE_JOBS.md).
+Cloudtasker also provides optional modules for running [cron jobs](docs/CRON_JOBS.md), [batch jobs](docs/BATCH_JOBS.md), [unique jobs](docs/UNIQUE_JOBS.md) and [storable jobs](docs/STORABLE_JOBS.md).
 
 A local processing server is also available for development. This local server processes jobs in lieu of Cloud Tasks and allows you to work offline.
 
@@ -31,12 +31,15 @@ A local processing server is also available for development. This local server p
 8. [Logging](#logging)
     1. [Configuring a logger](#configuring-a-logger)
     2. [Logging context](#logging-context)
+    3. [Truncating log arguments](#truncating-log-arguments)
+    4. [Searching logs: Job ID vs Task ID](#searching-logs-job-id-vs-task-id)
 9. [Error Handling](#error-handling)
     1. [HTTP Error codes](#http-error-codes)
     2. [Worker callbacks](#worker-callbacks)
     3. [Global callbacks](#global-callbacks)
     4. [Max retries](#max-retries)
-    5. [Dispatch deadline](#dispatch-deadline)
+    5. [Conditional reenqueues using retry errors](#conditional-reenqueues-using-retry-errors)
+    6. [Dispatch deadline](#dispatch-deadline)
 10. [Testing](#testing)
     1. [Test helper setup](#test-helper-setup)
     2. [In-memory queues](#in-memory-queues)
@@ -137,7 +140,7 @@ Now jump to the next section to configure your app to use Google Cloud Tasks as 
 
 ## Get started with Rails & ActiveJob
 **Note**: ActiveJob is supported since `0.11.0`  
-**Note**: Cloudtasker extensions (cron, batch and unique jobs) are not available when using cloudtasker via ActiveJob.
+**Note**: Cloudtasker extensions (cron, batch, unique jobs and storable) are not available when using cloudtasker via ActiveJob.
 
 Cloudtasker is pre-integrated with ActiveJob. Follow the steps below to get started.
 
@@ -269,6 +272,9 @@ Cloudtasker.configure do |config|
   #
   # Specify the namespace for your Cloud Task queues.
   #
+  # Specifying a namespace is optional but strongly recommended to keep
+  # queues organised, especially in a micro-service environment.
+  #
   # The gem assumes that a least a default queue named 'my-app-default'
   # exists in Cloud Tasks. You can create this default queue using the
   # gcloud SDK or via the `rake cloudtasker:setup_queue` task if you use Rails.
@@ -325,7 +331,8 @@ Cloudtasker.configure do |config|
   # Specify the redis connection hash.
   #
   # This is ONLY required in development for the Cloudtasker local server and in
-  # all environments if you use any cloudtasker extension (unique jobs, cron jobs or batch jobs)
+  # all environments if you use any cloudtasker extension (unique jobs, cron jobs,
+  # batch jobs or storable jobs)
   #
   # See https://github.com/redis/redis-rb for examples of configuration hashes.
   #
@@ -367,6 +374,8 @@ Cloudtasker.configure do |config|
   # Supported since: v0.12.0
   #
   # Default: 600 seconds (10 minutes)
+  # Min: 15 seconds
+  # Max: 1800 seconds (30 minutes)
   #
   # config.dispatch_deadline = 600
 
@@ -399,6 +408,40 @@ Cloudtasker.configure do |config|
   # Default: no operation
   #
   # config.on_dead = ->(error, worker) { Rollbar.error(error) }
+
+  #
+  # Specify the Open ID Connect (OIDC) details to connect to a protected GCP service, such
+  # as a private Cloud Run application.
+  #
+  # The configuration supports the following details:
+  # - service_account_email: This is the "act as" user. It can be found under the security details
+  #   of the Cloud Run service.
+  # - audience: The audience is usually the publicly accessible host for the Cloud Run service
+  #   (which is the same value configured as the processor_host). If no audiences are provided
+  #   it will be set to the processor_host.
+  #
+  # Note: If the OIDC token is used for a Cloud Run service make sure to include the
+  # `iam.serviceAccounts.actAs` permission on the service account.
+  #
+  # See https://cloud.google.com/tasks/docs/creating-http-target-tasks#sa for more information on
+  # setting up service accounts for use with Cloud Tasks.
+  #
+  # Supported since: v0.14.0
+  #
+  # Default: nil 
+  #
+  # config.oidc = { service_account_email: 'example@gserviceaccount.com' }
+  # config.oidc = { service_account_email: 'example@gserviceaccount.com', audience: 'https://api.example.net' }
+
+  #
+  # Enable/disable the verification of SSL certificates on the local processing server when
+  # sending tasks to the processor.
+  #
+  # Set to false to disable SSL verification (OpenSSL::SSL::VERIFY_NONE).
+  #
+  # Default: true
+  #
+  # config.local_server_ssl_verify = true
 end
 ```
 
@@ -446,6 +489,8 @@ class FetchResourceWorker
     # ...do some logic...
     if some_condition
       # Stop and re-enqueue the job to be run again in 10 seconds.
+      # Also see the section on Cloudtasker::RetryWorkerError for a different
+      # approach on reenqueuing.
       return reenqueue(10)
     else
       # ...keep going...
@@ -507,6 +552,7 @@ Cloudtasker comes with three optional features:
 - Cron Jobs [[docs](docs/CRON_JOBS.md)]: Run jobs at fixed intervals.
 - Batch Jobs [[docs](docs/BATCH_JOBS.md)]: Run jobs in jobs and track completion of the overall batch.
 - Unique Jobs [[docs](docs/UNIQUE_JOBS.md)]: Ensure uniqueness of jobs based on job arguments.
+- Storable Jobs [[docs](docs/STORABLE_JOBS.md)]: Park jobs until they are ready to be enqueued.
 
 ## Working locally
 
@@ -649,6 +695,60 @@ end
 
 See the [Cloudtasker::Worker class](lib/cloudtasker/worker.rb) for more information on attributes available to be logged in your `log_context_processor` proc.
 
+### Truncating log arguments
+**Supported since**: `v0.14.0`  
+
+By default Cloudtasker does not log job arguments as arguments can contain sensitive data and generate voluminous logs, which may lead to noticeable costs with your log provider (e.g. GCP Logging). Also some providers (e.g. GCP Logging) will automatically truncate log entries that are too big and reduce their searchability.
+
+Job arguments can be logged for all workers by configuring the following log context processor in your Cloudtasker initializer:
+```ruby
+Cloudtasker::WorkerLogger.log_context_processor = ->(worker) { worker.to_h }
+```
+
+In order to reduce the size of logged job arguments, the following `truncate` utility is provided by Cloudtasker: 
+```ruby
+# string_limit: The maximum size for strings. Default is 64. Set to -1 to disable.
+# array_limit: The maximum length for arrays. Default is 10. Set to -1 to disable.
+# max_depth: The maximum recursive depth. Default is 3. Set to -1 to disable.
+Cloudtasker::WorkerLogger.truncate(payload, string_limit: 64, array_limit: 10, max_depth: 3)
+```
+
+You may use it the following way:
+```ruby
+Cloudtasker::WorkerLogger.log_context_processor = lambda do |worker|
+  payload = worker.to_h
+
+  # Using default options
+  payload[:job_args] = Cloudtasker::WorkerLogger.truncate(payload[:job_args])
+
+  # Using custom options
+  # payload[:job_args] = Cloudtasker::WorkerLogger.truncate(payload[:job_args], string_limit: 32, array_limit: 5, max_depth: 2)
+
+  # Return the payload to log
+  payload
+end
+```
+
+To further reduce logging cost, you may also log a reasonably complete version of job arguments at start then log a watered down version for the remaining log entries:
+```ruby
+Cloudtasker::WorkerLogger.log_context_processor = lambda do |worker|
+  payload = worker.to_h
+
+  # Adjust the log payload based on the lifecycle of the job
+  payload[:job_args] = if worker.perform_started_at
+                         # The job start has already been logged. Log the job primitive arguments without depth.
+                         # Arrays and hashes will be masked.
+                         Cloudtasker::WorkerLogger.truncate(payload[:job_args], max_depth: 0)
+                       else
+                         # This is the job start. Log a more complete version of the job args.
+                         Cloudtasker::WorkerLogger.truncate(payload[:job_args])
+                       end
+
+  # Return the payload to log
+  payload
+end
+```
+
 ### Searching logs: Job ID vs Task ID
 **Note**: `task_id` field is available in logs starting with `0.10.0`
 
@@ -732,7 +832,7 @@ By default jobs are retried 25 times - using an exponential backoff - before bei
 
 Note that the number of retries set on your Cloud Task queue should be many times higher than the number of retries configured in Cloudtasker because Cloud Task also includes failures to connect to your application. Ideally set the number of retries to `unlimited` in Cloud Tasks.
 
-**Note**: The `X-CloudTasks-TaskExecutionCount` header sent by Google Cloud Tasks and providing the number of retries outside of `HTTP 503` (instance not reachable) is currently bugged and remains at `0` all the time. Starting with `v0.10.0` Cloudtasker uses the `X-CloudTasks-TaskRetryCount` header to detect the number of retries. This header includes `HTTP 503` errors which means that if your application is down at some point, jobs will fail and these failures will be counted toward the maximum number of retries. A [bug report](https://issuetracker.google.com/issues/154532072) has been raised with GCP to address this issue. Once fixed we will revert to using `X-CloudTasks-TaskExecutionCount` to avoid counting `HTTP 503` as job failures.
+**Note**: Versions prior to `v0.14.0` use the `X-CloudTasks-TaskRetryCount` header for retries instead of the `X-CloudTasks-TaskExecutionCount` header to detect the number of retries, because there a previous bug on the GCP side which made the `X-CloudTasks-TaskExecutionCount` stay at zero instead of increasing on successive executions. Versions prior to `v0.14.0` count any failure as failure, including failures due to the backend being unavailable (`HTTP 503`). Versions `v0.14.0` and later only count application failure (`HTTP 4xx`) as failure for retry purpose.
 
 E.g. Set max number of retries globally via the cloudtasker initializer.
 ```ruby
@@ -784,6 +884,46 @@ class SomeErrorWorker
 
   def perform(arg1, arg2)
     raise(ArgumentError)
+  end
+end
+```
+
+### Conditional reenqueues using retry errors
+**Supported since**: `v0.14.0`  
+
+If your worker is waiting for some precondition to occur and you want to re-enqueue it until the condition has been met, you can raise a `Cloudtasker::RetryWorkerError`. This special error will fail your job **without logging an error** while still increasing the number of retries.
+
+This is a safer approach than using the `reenqueue` helper, which can lead to forever running jobs if not used properly.
+
+```ruby
+# app/workers/my_worker.rb
+
+class MyWorker
+  include Cloudtasker::Worker
+
+  def perform(project_id)
+    # Abort if project does not exist
+    return unless (project = Project.find_by(id: project_id))
+
+    # Trigger a retry if the project is still in "discovering" status
+    # This error will NOT log an error. It only triggers a retry.
+    raise Cloudtasker::RetryWorkerError if project.status == 'discovering'
+
+    # The previous approach was to use `reenqueue`. This works but since it
+    # does not increase the number of retries, you may end up with forever running
+    # jobs
+    # return reenqueue(10) if project.status == 'discovering'
+
+    # Do stuff when project is not longer discovering
+    do_some_stuff
+  end
+
+  # You can then specify what should be done if we've been waiting for too long
+  def on_dead(error)
+    logger.error("Looks like the project is forever discovering. Time to give up.")
+
+    # This is of course an imaginary method
+    send_slack_notification_to_internal_support_team(worker: self.class, args: job_args)
   end
 end
 ```
@@ -863,7 +1003,7 @@ Each testing mode accepts a block argument to temporarily switch to it:
 Cloudtasker::Testing.fake!
 
 # Enable inline! mode temporarily for a given test
-Cloudtasker.inline! do
+Cloudtasker::Testing.inline! do
    MyWorker.perform_async(1,2)
 end
 ```
@@ -1089,7 +1229,7 @@ To size the concurrency of your queues you should therefore take the most limiti
 After checking out the repo, run `bin/setup` to install dependencies.
 
 For tests, run `rake` to run the tests. Note that Rails is not in context by default, which means Rails-specific test will not run.
-For tests including Rails-specific tests, run `bundle exec appraisal rails-7.0 rake`
+For tests including Rails-specific tests, run `bundle exec appraisal rails_7.0 rake`
 For all context-specific tests (incl. Rails), run the [appraisal tests](Appraisals) using `bundle exec appraisal rake`.
 
 You can run `bin/console` for an interactive prompt that will allow you to experiment.

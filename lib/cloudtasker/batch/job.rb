@@ -10,7 +10,21 @@ module Cloudtasker
       JOBS_NAMESPACE = 'jobs'
       STATES_NAMESPACE = 'states'
 
-      # List of statuses triggering a completion callback
+      # List of sub-job statuses taken into account when evaluating
+      # if the batch is complete.
+      #
+      # Batch jobs go through the following states:
+      # - scheduled: the parent batch has enqueued a worker for the child job
+      # - processing: the child job is running
+      # - completed: the child job has completed successfully
+      # - errored: the child job has encountered an error and must retry
+      # - dead: the child job has exceeded its max number of retries
+      #
+      # The 'dead' status is considered to be a completion status as it
+      # means that the job will never succeed. There is no point in blocking
+      # the batch forever so we proceed forward eventually.
+      #
+      BATCH_STATUSES = %w[scheduled processing completed errored dead all].freeze
       COMPLETION_STATUSES = %w[completed dead].freeze
 
       # These callbacks do not need to raise errors on their own
@@ -170,12 +184,40 @@ module Cloudtasker
       end
 
       #
-      # The list of jobs in the batch
+      # Return the key under which the batch progress is stored
+      # for a specific state.
+      #
+      # @return [String] The batch progress state namespaced id.
+      #
+      def batch_state_count_gid(state)
+        "#{batch_state_gid}/state_count/#{state}"
+      end
+
+      #
+      # Return the number of jobs in a given state
+      #
+      # @return [String] The batch progress state namespaced id.
+      #
+      def batch_state_count(state)
+        redis.get(batch_state_count_gid(state)).to_i
+      end
+
+      #
+      # The list of jobs to be enqueued in the batch
       #
       # @return [Array<Cloudtasker::Worker>] The jobs to enqueue at the end of the batch.
       #
-      def jobs
-        @jobs ||= []
+      def pending_jobs
+        @pending_jobs ||= []
+      end
+
+      #
+      # The list of jobs that have been enqueued as part of the batch
+      #
+      # @return [Array<Cloudtasker::Worker>] The jobs enqueued as part of the batch.
+      #
+      def enqueued_jobs
+        @enqueued_jobs ||= []
       end
 
       #
@@ -195,7 +237,7 @@ module Cloudtasker
       # @param [Class] worker_klass The worker class.
       # @param [Array<any>] *args The worker arguments.
       #
-      # @return [Array<Cloudtasker::Worker>] The updated list of jobs.
+      # @return [Array<Cloudtasker::Worker>] The updated list of pending jobs.
       #
       def add(worker_klass, *args)
         add_to_queue(worker.job_queue, worker_klass, *args)
@@ -208,10 +250,10 @@ module Cloudtasker
       # @param [Class] worker_klass The worker class.
       # @param [Array<any>] *args The worker arguments.
       #
-      # @return [Array<Cloudtasker::Worker>] The updated list of jobs.
+      # @return [Array<Cloudtasker::Worker>] The updated list of pending jobs.
       #
       def add_to_queue(queue, worker_klass, *args)
-        jobs << worker_klass.new(
+        pending_jobs << worker_klass.new(
           job_args: args,
           job_meta: { key(:parent_id) => batch_id },
           job_queue: queue
@@ -237,20 +279,36 @@ module Cloudtasker
       end
 
       #
-      # Save the batch.
+      # This method initializes the batch job counters if not set already
+      #
+      def migrate_progress_stats_to_redis_counters
+        # Abort if counters have already been set. The 'all' counter acts as a feature flag.
+        return if redis.exists?(batch_state_count_gid('all'))
+
+        # Get all job states
+        values = batch_state.values
+
+        # Count by value
+        redis.multi do |m|
+          # Per status
+          values.tally.each do |k, v|
+            m.set(batch_state_count_gid(k), v)
+          end
+
+          # All counter
+          m.set(batch_state_count_gid('all'), values.size)
+        end
+      end
+
+      #
+      # Save serialized version of the worker.
+      #
+      # This is required to be able to invoke callback methods in the
+      # context of the worker (= instantiated worker) when child workers
+      # complete (success or failure).
       #
       def save
-        # Save serialized version of the worker. This is required to
-        # be able to invoke callback methods in the context of
-        # the worker (= instantiated worker) when child workers
-        # complete (success or failure).
         redis.write(batch_gid, worker.to_h)
-
-        # Stop there if no jobs to save
-        return if jobs.empty?
-
-        # Save list of child workers
-        redis.hset(batch_state_gid, jobs.map { |e| [e.job_id, 'scheduled'] }.to_h)
       end
 
       #
@@ -262,8 +320,17 @@ module Cloudtasker
       def update_state(batch_id, status)
         migrate_batch_state_to_redis_hash
 
+        # Get current status
+        current_status = redis.hget(batch_state_gid, batch_id)
+        return if current_status == status.to_s
+
         # Update the batch state batch_id entry with the new status
-        redis.hset(batch_state_gid, batch_id, status) if redis.hexists(batch_state_gid, batch_id)
+        # and update counters
+        redis.multi do |m|
+          m.hset(batch_state_gid, batch_id, status)
+          m.decr(batch_state_count_gid(current_status))
+          m.incr(batch_state_count_gid(status))
+        end
       end
 
       #
@@ -288,7 +355,14 @@ module Cloudtasker
       # @return [any] The callback return value
       #
       def run_worker_callback(callback, *args)
-        worker.try(callback, *args)
+        worker.try(callback, *args).tap do
+          # Enqueue pending jobs if batch was expanded in callback
+          # A completed batch cannot receive additional jobs
+          schedule_pending_jobs if callback.to_sym != :on_batch_complete
+
+          # Schedule pending jobs on parent if batch was expanded
+          parent_batch&.schedule_pending_jobs
+        end
       rescue StandardError => e
         # There is no point in retrying jobs due to failure callbacks failing
         # Only completion callbacks will trigger a re-run of the job because
@@ -362,52 +436,89 @@ module Cloudtasker
         redis.hkeys(batch_state_gid).each { |id| self.class.find(id)&.cleanup }
 
         # Delete batch redis entries
-        redis.del(batch_gid)
-        redis.del(batch_state_gid)
+        redis.multi do |m|
+          m.del(batch_gid)
+          m.del(batch_state_gid)
+          BATCH_STATUSES.each { |e| m.del(batch_state_count_gid(e)) }
+        end
       end
 
       #
       # Calculate the progress of the batch.
+      #
+      # @param [Integer] depth The depth of calculation. Zero (default) means only immediate
+      #   children will be taken into account.
       #
       # @return [Cloudtasker::Batch::BatchProgress] The batch progress.
       #
       def progress(depth: 0)
         depth = depth.to_i
 
-        # Capture batch state
-        state = batch_state
+        # Initialize counters from batch state. This is only applicable to running batches
+        # that started before the counter-based progress was implemented/released.
+        migrate_progress_stats_to_redis_counters
 
         # Return immediately if we do not need to go down the tree
-        return BatchProgress.new(state) if depth <= 0
+        return BatchProgress.new([self]) if depth <= 0
 
         # Sum batch progress of current batch and sub-batches up to the specified
         # depth
-        state.to_h.reduce(BatchProgress.new(state)) do |memo, (child_id, child_status)|
-          memo + (self.class.find(child_id)&.progress(depth: depth - 1) ||
-            BatchProgress.new(child_id => child_status))
+        batch_state.to_h.reduce(BatchProgress.new([self])) do |memo, (child_id, _)|
+          memo + (self.class.find(child_id)&.progress(depth: depth - 1) || BatchProgress.new)
         end
+      end
+
+      #
+      # Schedule the child workers that were added to the batch
+      #
+      def schedule_pending_jobs
+        ret_list = []
+
+        while (j = pending_jobs.shift)
+          # Schedule the job
+          # Skip batch registration if the job was not actually scheduled
+          # E.g. the job was evicted due to uniqueness requirements
+          next unless j.schedule
+
+          # Initialize the batch state unless the job has already started (and taken
+          # hold of its own status)
+          # The batch state is initialized only after the job is scheduled to avoid
+          # having never-ending batches - which could occur if a batch was crashing
+          # while enqueuing children due to a OOM error and since 'scheduled' is a
+          # blocking status.
+          redis.multi do |m|
+            m.hsetnx(batch_state_gid, j.job_id, 'scheduled')
+            m.incr(batch_state_count_gid('scheduled'))
+            m.incr(batch_state_count_gid('all'))
+          end
+
+          # Flag job as enqueued
+          ret_list << j
+          enqueued_jobs << j
+        end
+
+        # Return the list of jobs just enqueued
+        ret_list
       end
 
       #
       # Save the batch and enqueue all child workers attached to it.
       #
-      # @return [Array<Cloudtasker::CloudTask>] The Google Task responses
-      #
       def setup
-        return true if jobs.empty?
+        return true if pending_jobs.empty?
 
         # Save batch
         save
 
-        # Enqueue all child workers
-        jobs.map(&:schedule)
+        # Schedule all child workers
+        schedule_pending_jobs
       end
 
       #
       # Post-perform logic. The parent batch is notified if the job is complete.
       #
       def complete(status = :completed)
-        return true if reenqueued? || jobs.any?
+        return true if reenqueued?
 
         # Notify the parent batch that a child is complete
         on_complete(status) if complete?
@@ -426,11 +537,12 @@ module Cloudtasker
         # Perform job
         yield
 
-        # Save batch if child jobs added
-        setup if jobs.any?
+        # Setup batch
+        # Only applicable if the batch has pending_jobs
+        setup
 
-        # Save parent batch if batch expanded
-        parent_batch&.setup if parent_batch&.jobs&.any?
+        # Save parent batch if batch was expanded
+        parent_batch&.schedule_pending_jobs
 
         # Complete batch
         complete(:completed)

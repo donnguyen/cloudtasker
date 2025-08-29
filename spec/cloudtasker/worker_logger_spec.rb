@@ -53,7 +53,7 @@ RSpec.shared_examples 'a log appender' do |level|
     before { allow(logger).to receive(:logger).and_return(logger_adapter) }
 
     context 'with Logger' do
-      let(:logger_adapter) { ::Logger.new(nil) }
+      let(:logger_adapter) { Logger.new(nil) }
 
       it { expect { log_action }.not_to raise_error }
     end
@@ -85,10 +85,52 @@ RSpec.describe Cloudtasker::WorkerLogger do
     it { is_expected.to have_attributes(worker: worker) }
   end
 
+  describe '.truncate' do
+    subject { described_class.truncate(payload, **config) }
+
+    let(:payload) do
+      [
+        { string: 'a' * 100 },
+        { parent: {
+          array: [1] * 20,
+          child: {
+            subchild: { my: { sub: 'attribute' } }
+          }
+        } }
+      ]
+    end
+
+    context 'with no options specified' do
+      let(:config) { {} }
+      let(:expected) do
+        [{ string: "#{'a' * 61}..." },
+         { parent: { array: ([1] * 10) + ['...10 items...'], child: { subchild: '{hash}' } } }]
+      end
+
+      it { is_expected.to eq(expected) }
+    end
+
+    context 'with options specified' do
+      let(:config) { { string_limit: 10, array_limit: 2, max_depth: 4 } }
+      let(:expected) do
+        [{ string: 'aaaaaaa...' },
+         { parent: { array: [1, 1, '...18 items...'], child: { subchild: { my: '{hash}' } } } }]
+      end
+
+      it { is_expected.to eq(expected) }
+    end
+
+    context 'with all options disabled' do
+      let(:config) { { string_limit: -1, array_limit: -1, max_depth: -1 } }
+
+      it { is_expected.to eq(payload) }
+    end
+  end
+
   describe '#context_processor' do
     subject { logger.context_processor }
 
-    let(:processor) { ->(worker) { worker.to_h } }
+    let(:processor) { lambda(&:to_h) }
 
     context 'with no context_processor defined' do
       it { is_expected.to eq(described_class::DEFAULT_CONTEXT_PROCESSOR) }

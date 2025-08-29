@@ -147,7 +147,7 @@ RSpec.describe Cloudtasker::Cron::Job do
     end
 
     context 'with no time_at and Time.current' do
-      let(:time_current) { instance_double('Time') }
+      let(:time_current) { instance_double(Time) }
 
       before { allow(Time).to receive(:current).and_return(time_current) }
       around { |e| Timecop.freeze { e.run } }
@@ -158,10 +158,12 @@ RSpec.describe Cloudtasker::Cron::Job do
   describe '#next_time' do
     subject { job.next_time }
 
-    let(:current_time) { Time.now - 3600 * 24 * 30 }
+    let(:current_time) { Time.now - (3600 * 24 * 30) }
 
-    before { allow(job).to receive(:cron_schedule).and_return(cron_schedule) }
-    before { allow(job).to receive(:current_time).and_return(current_time) }
+    before do
+      allow(job).to receive_messages(cron_schedule: cron_schedule, current_time: current_time)
+    end
+
     it { is_expected.to eq(cron_schedule.next_time(current_time)) }
   end
 
@@ -205,22 +207,23 @@ RSpec.describe Cloudtasker::Cron::Job do
 
     let(:next_worker) { TestWorker.new }
     let(:task_id) { 'some-task-id' }
-    let(:resp) { instance_double('Cloudtasker::CloudTask', id: task_id) }
+    let(:resp) { instance_double(Cloudtasker::CloudTask, id: task_id) }
 
     before do
       allow(worker).to receive(:new_instance).and_return(next_worker)
-      allow(next_worker).to receive(:schedule).with(time_at: be_a(EtOrbi::EoTime)).and_return(resp)
+      allow(job).to receive(:cron_schedule).and_return(cron_schedule)
       allow(cron_schedule).to receive(:update).with(task_id: task_id, job_id: next_worker.job_id).and_return(true)
     end
 
-    context 'with no cron_schedule job' do
-      after { expect(next_worker).not_to have_received(:schedule) }
+    context 'with no cron_schedule' do
+      let(:cron_schedule) { nil }
+
+      before { expect(next_worker).not_to receive(:schedule) }
       it { is_expected.to be_falsey }
     end
 
     context 'with cron_schedule' do
-      before { allow(job).to receive(:cron_schedule).and_return(cron_schedule) }
-      after { expect(next_worker).to have_received(:schedule).with(time_at: job.next_time) }
+      before { expect(next_worker).to receive(:schedule).with(time_at: job.next_time).and_return(resp) }
       after { expect(next_worker.job_meta.get(job.key(:time_at))).to eq(job.next_time.iso8601) }
       it { is_expected.to be_truthy }
     end

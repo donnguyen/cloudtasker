@@ -3,10 +3,11 @@
 require 'google/cloud/tasks'
 
 if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '2'
+  require 'google/cloud/tasks/v2beta3'
   require 'cloudtasker/backend/google_cloud_task_v1'
 
   RSpec.describe Cloudtasker::Backend::GoogleCloudTaskV1 do
-    let(:relative_queue) { 'critical' }
+    let(:relative_queue) { 'highly-critical' }
     let(:task_name) do
       [
         'projects',
@@ -14,7 +15,7 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
         'locations',
         config.gcp_location_id,
         'queues',
-        "#{config.gcp_queue_prefix}-#{relative_queue}",
+        [config.gcp_queue_prefix, relative_queue].map(&:presence).compact.join('-'),
         'tasks',
         '111-222'
       ].join('/')
@@ -26,22 +27,23 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
           url: 'http://localhost:300/run',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer 123'
+            Authorization: 'Bearer 123'
           },
           body: { foo: 'bar' }.to_json
         },
         schedule_time: 2,
+        dispatch_deadline: 600,
         queue: relative_queue
       }
     end
     let(:config) { Cloudtasker.config }
-    let(:client) { instance_double('Google::Cloud::Tasks::V2beta3::Task') }
+    let(:client) { instance_double(Google::Cloud::Tasks::V2beta3::CloudTasksClient) }
 
     describe '.setup_queue' do
       subject { described_class.setup_queue(**opts) }
 
       let(:opts) { { name: relative_queue, concurrency: 20, retries: 100 } }
-      let(:queue) { instance_double('Google::Cloud::Tasks::V2beta3::Queue') }
+      let(:queue) { instance_double(Google::Cloud::Tasks::V2beta3::Queue) }
       let(:base_path) { 'foo/bar' }
       let(:queue_path) { 'foo/bar/baz' }
       let(:expected_payload) do
@@ -116,21 +118,39 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
       subject { described_class.queue_path(relative_queue) }
 
       let(:queue) { 'some-queue' }
-      let(:expected_args) do
-        [
-          config.gcp_project_id,
-          config.gcp_location_id,
-          [config.gcp_queue_prefix, relative_queue].join('-')
-        ]
-      end
 
       before { allow(described_class).to receive(:client).and_return(client) }
       before { allow(client).to receive(:queue_path).with(*expected_args).and_return(queue) }
-      it { is_expected.to eq(queue) }
+
+      context 'with gcp_queue_prefix' do
+        let(:expected_args) do
+          [
+            config.gcp_project_id,
+            config.gcp_location_id,
+            "#{config.gcp_queue_prefix}-#{relative_queue}"
+          ]
+        end
+
+        it { is_expected.to eq(queue) }
+      end
+
+      context 'with nil gcp_queue_prefix' do
+        let(:expected_args) { [config.gcp_project_id, config.gcp_location_id, relative_queue] }
+
+        before { allow(config).to receive(:gcp_queue_prefix).and_return(nil) }
+        it { is_expected.to eq(queue) }
+      end
+
+      context 'with empty gcp_queue_prefix' do
+        let(:expected_args) { [config.gcp_project_id, config.gcp_location_id, relative_queue] }
+
+        before { allow(config).to receive(:gcp_queue_prefix).and_return('') }
+        it { is_expected.to eq(queue) }
+      end
     end
 
-    describe '.format_schedule_time' do
-      subject { described_class.format_schedule_time(timestamp) }
+    describe '.format_protobuf_time' do
+      subject { described_class.format_protobuf_time(timestamp) }
 
       context 'with nil' do
         let(:timestamp) { nil }
@@ -146,26 +166,53 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
       end
     end
 
-    describe '.format_task_payload' do
-      subject { described_class.format_task_payload(job_payload) }
+    describe '.format_protobuf_duration' do
+      subject { described_class.format_protobuf_duration(duration) }
 
-      let(:expected_payload) do
-        payload = JSON.parse(job_payload.to_json, symbolize_names: true)
-        payload[:schedule_time] = described_class.format_schedule_time(job_payload[:schedule_time])
-        payload[:http_request][:headers]['Content-Type'] = 'text/json'
-        payload[:http_request][:headers]['Content-Transfer-Encoding'] = 'Base64'
-        payload[:http_request][:body] = Base64.encode64(job_payload[:http_request][:body])
-        payload
+      context 'with nil' do
+        let(:duration) { nil }
+
+        it { is_expected.to be_nil }
       end
 
-      it { is_expected.to eq(expected_payload) }
+      context 'with integer' do
+        let(:duration) { 600 }
+        let(:expected) { Google::Protobuf::Duration.new.tap { |e| e.seconds = duration } }
+
+        it { is_expected.to eq(expected) }
+      end
+    end
+
+    describe '.format_task_payload' do
+      subject { described_class.format_task_payload(arg_payload) }
+
+      let(:arg_payload) { job_payload }
+      let(:expected_payload) do
+        payload = JSON.parse(arg_payload.to_json, symbolize_names: true)
+        payload[:schedule_time] = described_class.format_protobuf_time(arg_payload[:schedule_time])
+        payload[:dispatch_deadline] = described_class.format_protobuf_duration(arg_payload[:dispatch_deadline])
+        payload[:http_request][:headers]['Content-Type'] = 'text/json'
+        payload[:http_request][:headers]['Content-Transfer-Encoding'] = 'Base64'
+        payload[:http_request][:body] = Base64.encode64(arg_payload[:http_request][:body])
+        payload.compact
+      end
+
+      context 'with defined keys' do
+        it { is_expected.to eq(expected_payload) }
+      end
+
+      context 'with nil keys' do
+        let(:arg_payload) { job_payload.merge(some_nil_key: nil) }
+
+        it { is_expected.to eq(expected_payload) }
+      end
     end
 
     describe '.find' do
       subject { described_class.find(id) }
 
       let(:id) { '123' }
-      let(:resp) { instance_double('Google::Cloud::Tasks::V2beta3::Task') }
+      let(:resp) { instance_double(Google::Cloud::Tasks::V2beta3::Task) }
       let(:task) { instance_double(described_class.to_s) }
 
       before { allow(described_class).to receive(:client).and_return(client) }
@@ -200,12 +247,13 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
 
       let(:id) { '123' }
       let(:queue) { 'some-queue' }
-      let(:resp) { instance_double('Google::Cloud::Tasks::V2beta3::Task') }
+      let(:resp) { instance_double(Google::Cloud::Tasks::V2beta3::Task) }
       let(:task) { instance_double(described_class.to_s) }
       let(:expected_payload) do
         payload = JSON.parse(job_payload.to_json, symbolize_names: true)
         payload.delete(:queue)
-        payload[:schedule_time] = described_class.format_schedule_time(job_payload[:schedule_time])
+        payload[:schedule_time] = described_class.format_protobuf_time(job_payload[:schedule_time])
+        payload[:dispatch_deadline] = described_class.format_protobuf_duration(job_payload[:dispatch_deadline])
         payload[:http_request][:headers]['Content-Type'] = 'text/json'
         payload[:http_request][:headers]['Content-Transfer-Encoding'] = 'Base64'
         payload[:http_request][:body] = Base64.encode64(job_payload[:http_request][:body])
@@ -248,7 +296,7 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
       subject { described_class.delete(id) }
 
       let(:id) { '123' }
-      let(:resp) { instance_double('Google::Cloud::Tasks::V2beta3::Task') }
+      let(:resp) { instance_double(Google::Cloud::Tasks::V2beta3::Task) }
 
       before { allow(described_class).to receive(:client).and_return(client) }
 
@@ -293,7 +341,7 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
     describe '.new' do
       subject { described_class.new(resp) }
 
-      let(:resp) { instance_double('Google::Cloud::Tasks::V2beta3::Task') }
+      let(:resp) { instance_double(Google::Cloud::Tasks::V2beta3::Task) }
 
       it { is_expected.to have_attributes(gcp_task: resp) }
     end
@@ -301,10 +349,22 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
     describe '#relative_queue' do
       subject { described_class.new(resp).relative_queue }
 
-      let(:resp) { instance_double('Google::Cloud::Tasks::V2beta3::Task', name: task_name, to_h: resp_payload) }
+      let(:resp) { double(Google::Cloud::Tasks::V2beta3::Task, name: task_name, to_h: resp_payload) }
       let(:resp_payload) { job_payload.merge(schedule_time: { seconds: job_payload[:schedule_time] }) }
 
-      it { is_expected.to eq(relative_queue) }
+      context 'with gcp_queue_prefix' do
+        it { is_expected.to eq(relative_queue) }
+      end
+
+      context 'with nil gcp_queue_prefix' do
+        before { allow(Cloudtasker.config).to receive(:gcp_queue_prefix).and_return(nil) }
+        it { is_expected.to eq(relative_queue) }
+      end
+
+      context 'with blank gcp_queue_prefix' do
+        before { allow(Cloudtasker.config).to receive(:gcp_queue_prefix).and_return('') }
+        it { is_expected.to eq(relative_queue) }
+      end
     end
 
     describe '#to_h' do
@@ -314,12 +374,13 @@ if !defined?(Google::Cloud::Tasks::VERSION) || Google::Cloud::Tasks::VERSION < '
       let(:resp_payload) do
         job_payload.merge(
           schedule_time: { seconds: job_payload[:schedule_time] },
+          dispatch_deadline: { seconds: job_payload[:dispatch_deadline] },
           response_count: retries
         )
       end
       let(:resp) do
-        instance_double(
-          'Google::Cloud::Tasks::V2beta3::Task',
+        double(
+          Google::Cloud::Tasks::V2beta3::Task,
           name: task_name,
           to_h: resp_payload
         )

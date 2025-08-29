@@ -8,7 +8,7 @@ RSpec.describe Cloudtasker::Worker do
 
     let(:worker_hash) { { 'foo' => 'bar' } }
     let(:serialized_worker) { worker_hash.to_json }
-    let(:worker) { instance_double('TestWorker') }
+    let(:worker) { instance_double(TestWorker) }
 
     before { allow(described_class).to receive(:from_hash).with(worker_hash).and_return(worker) }
 
@@ -80,13 +80,41 @@ RSpec.describe Cloudtasker::Worker do
     end
   end
 
+  describe '.redis' do
+    subject { worker_class.redis }
+
+    it { is_expected.to be_a(Cloudtasker::RedisClient) }
+  end
+
+  describe '.cache_key' do
+    subject { worker_class.cache_key(val) }
+
+    context 'with value' do
+      let(:val) { :some_key }
+
+      it { is_expected.to eq([worker_class.to_s.underscore, val.to_s].join('/')) }
+    end
+
+    context 'with values' do
+      let(:val) { %i[key1 key2] }
+
+      it { is_expected.to eq([worker_class.to_s.underscore, val].flatten.map(&:to_s).join('/')) }
+    end
+
+    context 'with nil' do
+      let(:val) { nil }
+
+      it { is_expected.to eq(worker_class.to_s.underscore) }
+    end
+  end
+
   describe '.perform_at' do
     subject { worker_class.perform_at(time_at, arg1, arg2) }
 
     let(:time_at) { Time.now }
     let(:arg1) { 1 }
     let(:arg2) { 2 }
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
 
     before { allow(worker_class).to receive(:schedule).with(time_at: time_at, args: [arg1, arg2]).and_return(resp) }
 
@@ -99,7 +127,7 @@ RSpec.describe Cloudtasker::Worker do
     let(:delay) { 10 }
     let(:arg1) { 1 }
     let(:arg2) { 2 }
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
 
     before { allow(worker_class).to receive(:schedule).with(time_in: delay, args: [arg1, arg2]).and_return(resp) }
 
@@ -111,7 +139,7 @@ RSpec.describe Cloudtasker::Worker do
 
     let(:arg1) { 1 }
     let(:arg2) { 2 }
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
 
     before { allow(worker_class).to receive(:schedule).with(args: [arg1, arg2]).and_return(resp) }
     it { is_expected.to eq(resp) }
@@ -124,8 +152,8 @@ RSpec.describe Cloudtasker::Worker do
     let(:delay) { 10 }
     let(:arg1) { 1 }
     let(:arg2) { 2 }
-    let(:task) { instance_double('Cloudtasker::WorkerHandler') }
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:task) { instance_double(Cloudtasker::WorkerHandler) }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
     let(:worker) { instance_double(worker_class.to_s) }
 
     before { allow(worker_class).to receive(:new).with(job_queue: queue, job_args: [arg1, arg2]).and_return(worker) }
@@ -153,7 +181,7 @@ RSpec.describe Cloudtasker::Worker do
 
     before { worker_class.cloudtasker_options(opts) }
     after { worker_class.cloudtasker_options(original_opts) }
-    it { is_expected.to eq(Hash[opts.map { |k, v| [k.to_sym, v] }]) }
+    it { is_expected.to eq(opts.transform_keys(&:to_sym)) }
   end
 
   describe '.max_retries' do
@@ -349,8 +377,8 @@ RSpec.describe Cloudtasker::Worker do
     let(:delay) { 10 }
     let(:arg1) { 1 }
     let(:arg2) { 2 }
-    let(:task) { instance_double('Cloudtasker::WorkerHandler') }
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:task) { instance_double(Cloudtasker::WorkerHandler) }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
     let(:worker) { worker_class.new(job_args: [1, 2]) }
     let(:cal_time_at) { Time.now + 3600 }
 
@@ -385,45 +413,65 @@ RSpec.describe Cloudtasker::Worker do
     end
 
     context 'with server middleware chain' do
-      before { allow(worker).to receive(:perform).with(*args).and_return(resp) }
-      before { expect(worker).to have_attributes(perform_started_at: nil, perform_ended_at: nil) }
-      before { Cloudtasker.config.server_middleware.add(TestMiddleware) }
-      after { expect(worker.middleware_called).to be_truthy }
-      after { expect(worker).to have_attributes(perform_started_at: be_a(Time), perform_ended_at: be_a(Time)) }
+      before do
+        allow(worker).to receive(:perform).with(*args).and_return(resp)
+        expect(worker).to have_attributes(perform_started_at: nil, perform_ended_at: nil)
+        Cloudtasker.config.server_middleware.add(TestMiddleware)
+      end
+
+      after do
+        expect(worker.middleware_called).to be_truthy
+        expect(worker).to have_attributes(perform_started_at: be_a(Time), perform_ended_at: be_a(Time))
+      end
+
       it { is_expected.to eq(resp) }
     end
 
     context 'with runtime error' do
       let(:error) { StandardError.new('some-message') }
 
-      before { allow(worker).to receive(:perform).and_raise(error) }
-      before { allow(worker).to receive(:on_error) }
-      after { expect(worker).to have_received(:on_error).with(error) }
+      before do
+        allow(worker).to receive(:perform).and_raise(error)
+        expect(worker).to receive(:on_error).with(error)
+      end
+
+      it { expect { execute }.to raise_error(error) }
+    end
+
+    context 'with RetryWorkerError' do
+      let(:error) { Cloudtasker::RetryWorkerError.new }
+
+      before do
+        allow(worker).to receive(:perform).and_raise(error)
+        expect(worker).not_to receive(:on_error).with(error)
+      end
+
       it { expect { execute }.to raise_error(error) }
     end
 
     context 'with dying job' do
       let(:error) { StandardError.new('some-message') }
 
-      before { worker.job_retries = worker_class.max_retries }
-      before { allow(worker).to receive(:perform).and_raise(error) }
-      before { allow(worker).to receive(:on_error) }
-      before { allow(worker).to receive(:on_dead) }
-      after { expect(worker).to have_received(:on_error).with(error) }
-      after { expect(worker).to have_received(:on_dead).with(error) }
+      before do
+        worker.job_retries = worker_class.max_retries
+        expect(worker).to receive(:perform).and_raise(error)
+        expect(worker).to receive(:on_error).with(error)
+        expect(worker).to receive(:on_dead).with(error)
+      end
+
       it { expect { execute }.to raise_error(Cloudtasker::DeadWorkerError) }
     end
 
     context 'with dead job' do
       let(:error) { StandardError.new('some-message') }
 
-      before { worker.job_retries = worker_class.max_retries + 1 }
-      before { allow(worker).to receive(:perform) }
-      before { allow(worker).to receive(:on_error) }
-      before { allow(worker).to receive(:on_dead) }
-      after { expect(worker).not_to have_received(:perform) }
-      after { expect(worker).not_to have_received(:on_error) }
-      after { expect(worker).to have_received(:on_dead).with(be_a(Cloudtasker::DeadWorkerError)) }
+      before do
+        worker.job_retries = worker_class.max_retries + 1
+        expect(worker).not_to receive(:perform)
+        expect(worker).not_to receive(:on_error)
+        expect(worker).to receive(:on_dead).with(be_a(Cloudtasker::DeadWorkerError))
+      end
+
       it { expect { execute }.to raise_error(Cloudtasker::DeadWorkerError) }
     end
 
@@ -441,7 +489,7 @@ RSpec.describe Cloudtasker::Worker do
     let(:worker) { worker_class.new(job_args: args) }
     let(:args) { [1, 2] }
 
-    let(:resp) { instance_double('Cloudtasker::CloudTask') }
+    let(:resp) { instance_double(Cloudtasker::CloudTask) }
 
     before { allow(worker).to receive(:schedule).with(interval: delay).and_return(resp) }
     after { expect(worker.job_reenqueued).to be_truthy }
@@ -508,7 +556,7 @@ RSpec.describe Cloudtasker::Worker do
     end
 
     context 'with different job_id' do
-      it { is_expected.not_to eq(worker_class.new(job_id: worker.job_id + 'a')) }
+      it { is_expected.not_to eq(worker_class.new(job_id: "#{worker.job_id}a")) }
     end
 
     context 'with different object' do

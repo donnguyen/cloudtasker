@@ -6,15 +6,28 @@ module Cloudtasker
   module Batch
     # Capture the progress of a batch
     class BatchProgress
-      attr_reader :batch_state
+      attr_reader :batches
 
       #
       # Build a new instance of the class.
       #
-      # @param [Hash] batch_state The batch state
+      # @param [Array<Cloudtasker::Batch::Job>] batches The batches to consider
       #
-      def initialize(batch_state = {})
-        @batch_state = batch_state
+      def initialize(batches = [])
+        @batches = batches
+      end
+
+      # Count the number of items in a given status
+
+      #
+      # Count the number of items in a given status
+      #
+      # @param [String] status The status to count
+      #
+      # @return [Integer] The number of jobs in the status
+      #
+      def count(status = 'all')
+        batches.sum { |e| e.batch_state_count(status) }
       end
 
       #
@@ -92,12 +105,26 @@ module Cloudtasker
       #
       # Return the batch progress percentage.
       #
+      # A `min_total` can be specified to linearize the calculation, while jobs get added at
+      # the start of the batch.
+      #
+      # Similarly a `smoothing` parameter can be specified to add a constant to the total
+      # and linearize the calculation, which becomes: `done / (total + smoothing)`
+      #
+      # @param [Integer] min_total The minimum for the total number of jobs
+      # @param [Integer] smoothing An additive smoothing for the total number of jobs
+      #
       # @return [Float] The progress percentage.
       #
-      def percent
-        return 0 if total.zero?
+      def percent(min_total: 0, smoothing: 0)
+        # Get the total value to use
+        actual_total = [min_total, total + smoothing].max
 
-        (done.to_f / total) * 100
+        # Abort if we cannot divide
+        return 0 if actual_total.zero?
+
+        # Calculate progress
+        (done.to_f / actual_total) * 100
       end
 
       #
@@ -108,16 +135,7 @@ module Cloudtasker
       # @return [Cloudtasker::Batch::BatchProgress] The sum of the two batch progresses.
       #
       def +(other)
-        self.class.new(batch_state.to_h.merge(other.batch_state.to_h))
-      end
-
-      private
-
-      # Count the number of items in a given status
-      def count(status = nil)
-        return batch_state.to_h.keys.size unless status
-
-        batch_state.to_h.values.count { |e| e == status }
+        self.class.new(batches + other.batches)
       end
     end
   end

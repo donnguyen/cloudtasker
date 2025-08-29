@@ -1,0 +1,22 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+ruby '~> 3.3'
+
+# Bundle edge Rails instead: gem 'rails', github: 'rails/rails'
+gem 'rails', '~> 7.1'
+
+# Application server
+gem 'puma'
+
+# Background jobs via Cloud Tasks
+gem 'cloudtasker', github: 'keypup-io/cloudtasker'
+
+# Active record adapter
+gem 'sqlite3'
+
+group :development do
+  gem 'foreman'
+end

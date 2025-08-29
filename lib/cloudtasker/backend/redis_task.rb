@@ -12,9 +12,9 @@ module Cloudtasker
       RETRY_INTERVAL = 20 # seconds
 
       #
-      # Return the cloudtasker redis client
+      # Return the Cloudtasker redis client
       #
-      # @return [Cloudtasker::RedisClient] The cloudtasker redis client..
+      # @return [Cloudtasker::RedisClient] The cloudtasker redis client.
       #
       def self.redis
         @redis ||= RedisClient.new
@@ -45,14 +45,14 @@ module Cloudtasker
           # to use Task Set instead.
           redis.search(key('*')).map do |gid|
             task_id = gid.sub(key(''), '')
-            redis.sadd(key, task_id)
+            redis.sadd(key, [task_id])
             find(task_id)
           end
         end
       end
 
       #
-      # Reeturn all tasks ready to process.
+      # Return all tasks ready to process.
       #
       # @param [String] queue The queue to retrieve items from.
       #
@@ -88,7 +88,7 @@ module Cloudtasker
 
         # Save job
         redis.write(key(id), payload)
-        redis.sadd(key, id)
+        redis.sadd(key, [id])
         new(**payload.merge(id: id))
       end
 
@@ -112,7 +112,7 @@ module Cloudtasker
       # @param [String] id The task id.
       #
       def self.delete(id)
-        redis.srem(key, id)
+        redis.srem(key, [id])
         redis.del(key(id))
       end
 
@@ -186,7 +186,7 @@ module Cloudtasker
           queue: queue,
           dispatch_deadline: dispatch_deadline
         )
-        redis.sadd(self.class.key, id)
+        redis.sadd(self.class.key, [id])
       end
 
       #
@@ -215,6 +215,9 @@ module Cloudtasker
         end
 
         resp
+      rescue Errno::ECONNREFUSED
+        retry_later(RETRY_INTERVAL)
+        Cloudtasker.logger.info(format_log_message("Processor not ready - Retry in #{RETRY_INTERVAL} seconds..."))
       rescue Net::ReadTimeout
         retry_later(RETRY_INTERVAL)
         Cloudtasker.logger.info(
@@ -257,7 +260,10 @@ module Cloudtasker
         @http_client ||=
           begin
             uri = URI(http_request[:url])
-            Net::HTTP.new(uri.host, uri.port).tap { |e| e.read_timeout = dispatch_deadline }
+            http = Net::HTTP.new(uri.host, uri.port).tap { |e| e.read_timeout = dispatch_deadline }
+            http.use_ssl = true if uri.instance_of?(URI::HTTPS)
+            http.verify_mode = OpenSSL::SSL::VERIFY_NONE unless Cloudtasker.config.local_server_ssl_verify
+            http
           end
       end
 

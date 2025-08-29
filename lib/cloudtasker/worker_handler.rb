@@ -53,6 +53,9 @@ module Cloudtasker
       # ActiveJob::QueueAdapters::CloudtaskerAdapter::JobWrapper might not be loaded
       return if worker.class.to_s =~ /^ActiveJob::/
 
+      # Do not log error when a retry was specifically requested
+      return if error.is_a?(RetryWorkerError)
+
       # Choose logger to use based on context
       # Worker will be nil on InvalidWorkerError - in that case we use generic logging
       logger = worker&.logger || Cloudtasker.logger
@@ -148,16 +151,21 @@ module Cloudtasker
     # @return [Hash] The task body
     #
     def task_payload
+      # Generate content
+      worker_payload_json = worker_payload.to_json
+
+      # Build payload
       {
         http_request: {
           http_method: 'POST',
           url: Cloudtasker.config.processor_url,
           headers: {
             Cloudtasker::Config::CONTENT_TYPE_HEADER => 'application/json',
-            Cloudtasker::Config::AUTHORIZATION_HEADER => "Bearer #{Authenticator.verification_token}"
-          },
-          body: worker_payload.to_json
-        },
+            Cloudtasker::Config::CT_SIGNATURE_HEADER => Authenticator.sign_payload(worker_payload_json)
+          }.compact,
+          oidc_token: Cloudtasker.config.oidc,
+          body: worker_payload_json
+        }.compact,
         dispatch_deadline: worker.dispatch_deadline.to_i,
         queue: worker.job_queue
       }
@@ -187,21 +195,19 @@ module Cloudtasker
     # @return [Hash] The worker args payload.
     #
     def worker_args_payload
-      @worker_args_payload ||= begin
-        if store_payload_in_redis?
-          # Store payload in Redis
-          self.class.redis.write(
-            self.class.key([REDIS_PAYLOAD_NAMESPACE, worker.job_id].join('/')),
-            worker.job_args
-          )
+      @worker_args_payload ||= if store_payload_in_redis?
+                                 # Store payload in Redis
+                                 self.class.redis.write(
+                                   self.class.key([REDIS_PAYLOAD_NAMESPACE, worker.job_id].join('/')),
+                                   worker.job_args
+                                 )
 
-          # Return reference to args payload
-          { job_args_payload_id: worker.job_id }
-        else
-          # Return regular job args payload
-          { job_args: worker.job_args }
-        end
-      end
+                                 # Return reference to args payload
+                                 { job_args_payload_id: worker.job_id }
+                               else
+                                 # Return regular job args payload
+                                 { job_args: worker.job_args }
+                               end
     end
 
     #

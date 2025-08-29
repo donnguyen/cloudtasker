@@ -14,20 +14,22 @@ RSpec.describe Cloudtasker::Config do
   let(:dispatch_deadline) { 15 * 60 }
   let(:on_error) { ->(e, w) {} }
   let(:on_dead) { ->(e, w) {} }
+  let(:oidc) { nil }
+  let(:local_server_ssl_verify) { false }
 
   let(:rails_hosts) { [] }
   let(:rails_secret) { 'rails_secret' }
   let(:rails_credentials) { { secret_key_base: rails_secret } }
   let(:rails_config) do
     if defined?(Rails) && Rails.application.config.respond_to?(:hosts)
-      instance_double('Rails::Application::Configuration', hosts: rails_hosts)
+      instance_double(Rails::Application::Configuration, hosts: rails_hosts)
     else
-      instance_double('Rails::Application::Configuration')
+      instance_double(Rails::Application::Configuration)
     end
   end
-  let(:rails_app) { instance_double('Dummy::Application', credentials: rails_credentials, config: rails_config) }
-  let(:rails_logger) { instance_double('ActiveSupport::Logger') }
-  let(:rails_klass) { class_double('Rails', application: rails_app, logger: rails_logger) }
+  let(:rails_app) { instance_double(Dummy::Application, credentials: rails_credentials, config: rails_config) }
+  let(:rails_logger) { instance_double(ActiveSupport::Logger) }
+  let(:rails_klass) { class_double(Rails, application: rails_app, logger: rails_logger) }
 
   let(:config) do
     Cloudtasker.configure do |c|
@@ -44,6 +46,8 @@ RSpec.describe Cloudtasker::Config do
       c.dispatch_deadline = dispatch_deadline
       c.on_error = on_error
       c.on_dead = on_dead
+      c.oidc = oidc
+      c.local_server_ssl_verify = local_server_ssl_verify
     end
 
     Cloudtasker.config
@@ -147,21 +151,23 @@ RSpec.describe Cloudtasker::Config do
   describe '#logger' do
     subject { config.logger }
 
-    context 'with no logger provided' do
-      let(:logger) { nil }
-
-      it { is_expected.to be_a(::Logger) }
-    end
-
     context 'with logger provided' do
       it { is_expected.to eq(logger) }
     end
 
-    context 'with Rails and no logger provided' do
-      let(:logger) { nil }
+    if defined?(Rails)
+      context 'with no logger provided and Rails' do
+        let(:logger) { nil }
 
-      before { stub_const('Rails', rails_klass) }
-      it { is_expected.to eq(rails_logger) }
+        before { stub_const('Rails', rails_klass) }
+        it { is_expected.to eq(rails_logger) }
+      end
+    else
+      context 'with no logger provided and no-Rails' do
+        let(:logger) { nil }
+
+        it { is_expected.to be_a(Logger) }
+      end
     end
   end
 
@@ -172,11 +178,13 @@ RSpec.describe Cloudtasker::Config do
       it { is_expected.to eq(secret) }
     end
 
-    context 'with Rails secret available' do
-      let(:secret) { nil }
+    if defined?(Rails)
+      context 'with Rails secret available' do
+        let(:secret) { nil }
 
-      before { stub_const('Rails', rails_klass) }
-      it { is_expected.to eq(rails_secret) }
+        before { stub_const('Rails', rails_klass) }
+        it { is_expected.to eq(rails_secret) }
+      end
     end
 
     context 'with no value' do
@@ -211,20 +219,6 @@ RSpec.describe Cloudtasker::Config do
       let(:gcp_project_id) { nil }
 
       it { expect { method }.to raise_error(StandardError, described_class::PROJECT_ID_MISSING_ERROR) }
-    end
-  end
-
-  describe '#gcp_queue_prefix' do
-    subject(:method) { config.gcp_queue_prefix }
-
-    context 'with value specified via config' do
-      it { is_expected.to eq(gcp_queue_prefix) }
-    end
-
-    context 'with no value' do
-      let(:gcp_queue_prefix) { nil }
-
-      it { expect { method }.to raise_error(StandardError, described_class::QUEUE_PREFIX_MISSING_ERROR) }
     end
   end
 
@@ -301,6 +295,48 @@ RSpec.describe Cloudtasker::Config do
     it { is_expected.to eq("#{config.processor_host}#{config.processor_path}") }
   end
 
+  describe '#oidc' do
+    subject(:oidc_config) { config.oidc }
+
+    context 'with no oidc configuration' do
+      let(:oidc) { nil }
+
+      it { is_expected.to be_nil }
+    end
+
+    context 'with oidc email only' do
+      let(:oidc) { { service_account_email: 'foo@bar.com' } }
+
+      it { is_expected.to eq(oidc.merge(audience: config.processor_host)) }
+    end
+
+    context 'with oidc email and audience' do
+      let(:oidc) { { service_account_email: 'foo@bar.com', audience: 'https://foo.bar' } }
+
+      it { is_expected.to eq(oidc) }
+    end
+
+    context 'with oidc object but email missing' do
+      let(:oidc) { { audience: 'https://foo.bar' } }
+
+      it { expect { oidc_config }.to raise_error(StandardError, described_class::OIDC_EMAIL_MISSING_ERROR) }
+    end
+  end
+
+  describe '#local_server_ssl_verify' do
+    subject { config.local_server_ssl_verify }
+
+    context 'with value specified via config' do
+      it { is_expected.to eq(local_server_ssl_verify) }
+    end
+
+    context 'with no value' do
+      let(:local_server_ssl_verify) { nil }
+
+      it { is_expected.to eq(described_class::DEFAULT_LOCAL_SERVER_SSL_VERIFY_MODE) }
+    end
+  end
+
   describe '#client_middleware' do
     subject(:middlewares) { config.client_middleware }
 
@@ -311,7 +347,7 @@ RSpec.describe Cloudtasker::Config do
     end
 
     it { is_expected.to be_a(Cloudtasker::Middleware::Chain) }
-    it { expect(middlewares).to be_exists(TestMiddleware) }
+    it { expect(middlewares).to exist(TestMiddleware) }
   end
 
   # Error hooks
@@ -343,6 +379,6 @@ RSpec.describe Cloudtasker::Config do
     end
 
     it { is_expected.to be_a(Cloudtasker::Middleware::Chain) }
-    it { expect(middlewares).to be_exists(TestMiddleware) }
+    it { expect(middlewares).to exist(TestMiddleware) }
   end
 end

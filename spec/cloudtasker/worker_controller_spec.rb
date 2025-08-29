@@ -29,21 +29,48 @@ if defined?(Rails)
       let(:meta) { { 'foo' => 'bar' } }
       let(:retries) { 3 }
       let(:queue) { 'some-queue' }
-      let(:auth_token) { Cloudtasker::Authenticator.verification_token }
+      let(:signature) { Cloudtasker::Authenticator.sign_payload(payload.to_json) }
+
+      let(:signature_header) { "HTTP_#{Cloudtasker::Config::CT_SIGNATURE_HEADER.tr('-', '_').upcase}" }
       let(:env_retries_header) { "HTTP_#{Cloudtasker::Config::RETRY_HEADER.tr('-', '_').upcase}" }
       let(:env_task_id_header) { "HTTP_#{Cloudtasker::Config::TASK_ID_HEADER.tr('-', '_').upcase}" }
 
-      before { request.env[env_retries_header] = retries }
-      before { request.env[env_task_id_header] = task_id }
+      before do
+        request.env[env_retries_header] = retries
+        request.env[env_task_id_header] = task_id
+      end
 
-      context 'with valid worker' do
+      context 'with X-Cloudtasker-Signature worker' do
         before do
-          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
-          allow(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
+          request.env[signature_header] = signature
+          expect(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
             .with(expected_payload)
             .and_return(true)
         end
-        after { expect(Cloudtasker::WorkerHandler).to have_received(:execute_from_payload!) }
+        it { is_expected.to be_successful }
+      end
+
+      context 'with Authorization header' do
+        let(:auth_token) { Cloudtasker::Authenticator.verification_token }
+
+        before do
+          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
+          expect(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
+            .with(expected_payload)
+            .and_return(true)
+        end
+        it { is_expected.to be_successful }
+      end
+
+      context 'with X-Cloudtasker-Authorization header' do
+        let(:auth_token) { Cloudtasker::Authenticator.verification_token }
+
+        before do
+          request.env['HTTP_X_CLOUDTASKER_AUTHORIZATION'] = "Bearer #{auth_token}"
+          expect(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
+            .with(expected_payload)
+            .and_return(true)
+        end
         it { is_expected.to be_successful }
       end
 
@@ -52,19 +79,18 @@ if defined?(Rails)
         let(:request_body) { Base64.encode64(payload.to_json) }
 
         before do
-          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
+          request.env[signature_header] = signature
           request.env['HTTP_CONTENT_TRANSFER_ENCODING'] = 'BASE64'
-          allow(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
+          expect(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
             .with(expected_payload)
             .and_return(true)
         end
-        after { expect(Cloudtasker::WorkerHandler).to have_received(:execute_from_payload!) }
         it { is_expected.to be_successful }
       end
 
       context 'with execution errors' do
         before do
-          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
+          request.env[signature_header] = signature
           allow(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
             .with(expected_payload)
             .and_raise(ArgumentError)
@@ -74,7 +100,7 @@ if defined?(Rails)
 
       context 'with dead worker' do
         before do
-          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
+          request.env[signature_header] = signature
           allow(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
             .with(expected_payload)
             .and_raise(Cloudtasker::DeadWorkerError)
@@ -84,7 +110,7 @@ if defined?(Rails)
 
       context 'with invalid worker' do
         before do
-          request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}"
+          request.env[signature_header] = signature
           allow(Cloudtasker::WorkerHandler).to receive(:execute_from_payload!)
             .with(expected_payload)
             .and_raise(Cloudtasker::InvalidWorkerError)
@@ -96,8 +122,13 @@ if defined?(Rails)
         it { is_expected.to have_http_status(:unauthorized) }
       end
 
-      context 'with invalid authentication' do
-        before { request.env['HTTP_AUTHORIZATION'] = "Bearer #{auth_token}aaa" }
+      context 'with invalid bearer authentication' do
+        before { request.env['HTTP_X_CLOUDTASKER_AUTHORIZATION'] = 'Bearer aaa' }
+        it { is_expected.to have_http_status(:unauthorized) }
+      end
+
+      context 'with invalid signature authentication' do
+        before { request.env[signature_header] = "#{signature}aaa" }
         it { is_expected.to have_http_status(:unauthorized) }
       end
     end
